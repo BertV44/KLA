@@ -18,6 +18,43 @@ K10's built-in log collector (`k10tools`) does a good job masking secret values,
 
 Standard OpenShift (`openshift-*`) and K10 (`kasten-io`) namespaces are **preserved** so logs remain useful for troubleshooting.
 
+## Performance
+
+Three versions are provided, each building on profiling data from the previous:
+
+| Version | Approach | Speed | Best for |
+|---------|----------|-------|----------|
+| `k10_log_anonymizer.py` (v1) | Per-line loop over each detected value | ~3.7 MB/s | Readability, easy to extend |
+| `k10_log_anonymizer_v2.py` (v2) | Single-pass compiled mega-regex | ~9.7 MB/s | Good balance of speed and simplicity |
+| `k10_log_anonymizer_v3.py` (v3) | Single-read cache + split mega-regex/IP pattern | ~11.8 MB/s | Large bundles, production use |
+
+Benchmarked on a 95 MB / 306k-line bundle (22 files, 65 unique patterns):
+
+| | v1 | v2 | v3 |
+|---|---|---|---|
+| Total time | 26.1s | 9.9s | 8.1s |
+| Throughput | 3.7 MB/s | 9.7 MB/s | 11.8 MB/s |
+
+**Projected for larger bundles:**
+
+| Bundle size | v1 | v2 | v3 |
+|-------------|-----|-----|-----|
+| 200 MB | ~54s | ~21s | ~17s |
+| 500 MB | ~2m15s | ~52s | ~42s |
+| 1 GB | ~4m30s | ~1m43s | ~1m25s |
+
+### Where the time goes (v3 profiling)
+
+Detection (reading + regex scanning) accounts for ~63% of total time. The two most expensive detection patterns are domain matching (scanning for `.apps.`, `.home`, `.local` etc.) and IP extraction, which together represent ~75% of the detection phase. These are fundamentally expensive because they must examine every character position in the text.
+
+Replacement accounts for ~37%. The key optimization between v2 and v3 is **not** putting IP addresses into the mega-regex. Profiling showed that a single `\d+\.\d+\.\d+\.\d+` pattern with a dict callback is **46% faster** than 51 literal IP alternations, because the regex engine handles character-class patterns far more efficiently than long alternation lists.
+
+Multiprocessing was tested and proved **counterproductive** on bundles under 200 MB — the cost of serializing file content to worker processes (pickle overhead) exceeds the parallelism gains.
+
+### Optional: Aho-Corasick acceleration
+
+If `pyahocorasick` is installed (`pip install pyahocorasick`), v3 will automatically use it for the non-IP literal matching pass. This replaces the regex alternation with an O(text_length) trie automaton, which scales better when the number of patterns grows into the hundreds (large multi-cluster environments with many namespaces, domains, and endpoints).
+
 ## Requirements
 
 - Python 3.10+
@@ -29,8 +66,10 @@ Standard OpenShift (`openshift-*`) and K10 (`kasten-io`) namespaces are **preser
 # 1. Extract the K10 log bundle
 unzip k10logs.zip -d k10logs
 
-# 2. Run the anonymizer
-python3 k10_log_anonymizer.py k10logs/k10logs anonymized_logs
+# 2. Run the anonymizer (pick your version)
+python3 k10_log_anonymizer.py k10logs/k10logs anonymized_logs       # v1 – simple, readable
+python3 k10_log_anonymizer_v2.py k10logs/k10logs anonymized_logs    # v2 – compiled mega-regex
+python3 k10_log_anonymizer_v3.py k10logs/k10logs anonymized_logs    # v3 – fastest, recommended
 
 # 3. Review the output
 cat anonymized_logs/_anonymization_summary.txt
@@ -39,7 +78,9 @@ cat anonymized_logs/_anonymization_summary.txt
 ## Usage
 
 ```
-python3 k10_log_anonymizer.py <input_dir> <output_dir>
+python3 k10_log_anonymizer.py <input_dir> <output_dir>       # v1
+python3 k10_log_anonymizer_v2.py <input_dir> <output_dir>    # v2
+python3 k10_log_anonymizer_v3.py <input_dir> <output_dir>    # v3 (recommended)
 ```
 
 | Argument | Description |
@@ -130,4 +171,3 @@ To anonymize additional categories, add:
 ## License
 
 Internal tooling — adapt and redistribute as needed within your TAM practice.
-
