@@ -13,52 +13,16 @@ K10's built-in log collector (`k10tools`) does a good job masking secret values,
 | 1 | **Cluster identity** – UUIDs and short names | `9969be77-a14a-4eb0-bc1b-cf15ce445146` → `00000000-0000-0000-abcd-ef0000000001` |
 | 2 | **FQDNs / OpenShift routes** | `k10-route-kasten-io.apps.oc02.home` → `redacted-host08.example.internal` |
 | 3 | **Object storage** – endpoints, buckets, S3 access keys | `gateway.storjshare.io` → `s3.anon-storage01.example.com` |
-| 5 | **IP addresses** – pod IPs, ClusterIPs, node IPs | `10.128.1.223` → `198.51.0.21` |
-| 7 | **Customer workload namespaces** | `pacman` → `app-ns-002` |
+| 4 | **IP addresses** – pod IPs, ClusterIPs, node IPs | `10.128.1.223` → `198.51.0.21` |
+| 5 | **Customer workload namespaces** | `pacman` → `app-ns-002` |
 
 Standard OpenShift (`openshift-*`) and K10 (`kasten-io`) namespaces are **preserved** so logs remain useful for troubleshooting.
-
-## Performance
-
-Three versions are provided, each building on profiling data from the previous:
-
-| Version | Approach | Speed | Best for |
-|---------|----------|-------|----------|
-| `k10_log_anonymizer.py` (v1) | Per-line loop over each detected value | ~3.7 MB/s | Readability, easy to extend |
-| `k10_log_anonymizer_v2.py` (v2) | Single-pass compiled mega-regex | ~9.7 MB/s | Good balance of speed and simplicity |
-| `k10_log_anonymizer_v3.py` (v3) | Single-read cache + split mega-regex/IP pattern | ~11.8 MB/s | Large bundles, production use |
-
-Benchmarked on a 95 MB / 306k-line bundle (22 files, 65 unique patterns):
-
-| | v1 | v2 | v3 |
-|---|---|---|---|
-| Total time | 26.1s | 9.9s | 8.1s |
-| Throughput | 3.7 MB/s | 9.7 MB/s | 11.8 MB/s |
-
-**Projected for larger bundles:**
-
-| Bundle size | v1 | v2 | v3 |
-|-------------|-----|-----|-----|
-| 200 MB | ~54s | ~21s | ~17s |
-| 500 MB | ~2m15s | ~52s | ~42s |
-| 1 GB | ~4m30s | ~1m43s | ~1m25s |
-
-### Where the time goes (v3 profiling)
-
-Detection (reading + regex scanning) accounts for ~63% of total time. The two most expensive detection patterns are domain matching (scanning for `.apps.`, `.home`, `.local` etc.) and IP extraction, which together represent ~75% of the detection phase. These are fundamentally expensive because they must examine every character position in the text.
-
-Replacement accounts for ~37%. The key optimization between v2 and v3 is **not** putting IP addresses into the mega-regex. Profiling showed that a single `\d+\.\d+\.\d+\.\d+` pattern with a dict callback is **46% faster** than 51 literal IP alternations, because the regex engine handles character-class patterns far more efficiently than long alternation lists.
-
-Multiprocessing was tested and proved **counterproductive** on bundles under 200 MB — the cost of serializing file content to worker processes (pickle overhead) exceeds the parallelism gains.
-
-### Optional: Aho-Corasick acceleration
-
-If `pyahocorasick` is installed (`pip install pyahocorasick`), v3 will automatically use it for the non-IP literal matching pass. This replaces the regex alternation with an O(text_length) trie automaton, which scales better when the number of patterns grows into the hundreds (large multi-cluster environments with many namespaces, domains, and endpoints).
 
 ## Requirements
 
 - Python 3.10+
 - No external dependencies (stdlib only)
+- Optional: `pyahocorasick` for faster literal matching on large pattern sets (see [Aho-Corasick acceleration](#optional-aho-corasick-acceleration))
 
 ## Quick start
 
@@ -66,10 +30,8 @@ If `pyahocorasick` is installed (`pip install pyahocorasick`), v3 will automatic
 # 1. Extract the K10 log bundle
 unzip k10logs.zip -d k10logs
 
-# 2. Run the anonymizer (pick your version)
-python3 k10_log_anonymizer.py k10logs/k10logs anonymized_logs       # v1 – simple, readable
-python3 k10_log_anonymizer_v2.py k10logs/k10logs anonymized_logs    # v2 – compiled mega-regex
-python3 k10_log_anonymizer_v3.py k10logs/k10logs anonymized_logs    # v3 – fastest, recommended
+# 2. Run the anonymizer
+python3 k10_log_anonymizer_v3.py k10logs/k10logs anonymized_logs
 
 # 3. Review the output
 cat anonymized_logs/_anonymization_summary.txt
@@ -78,9 +40,7 @@ cat anonymized_logs/_anonymization_summary.txt
 ## Usage
 
 ```
-python3 k10_log_anonymizer.py <input_dir> <output_dir>       # v1
-python3 k10_log_anonymizer_v2.py <input_dir> <output_dir>    # v2
-python3 k10_log_anonymizer_v3.py <input_dir> <output_dir>    # v3 (recommended)
+python3 k10_log_anonymizer_v3.py <input_dir> <output_dir>
 ```
 
 | Argument | Description |
@@ -124,17 +84,48 @@ Structure:
 }
 ```
 
+## Performance
+
+Benchmarked on a 95 MB / 306k-line bundle (22 files, 65 unique patterns):
+
+| Metric | Value |
+|--------|-------|
+| Total time | 8.1s |
+| Throughput | 11.8 MB/s |
+
+Projected for larger bundles:
+
+| Bundle size | Estimated time |
+|-------------|----------------|
+| 200 MB | ~17s |
+| 500 MB | ~42s |
+| 1 GB | ~1m25s |
+
+### How it works under the hood
+
+The script runs in two phases: **detection** (scan all files to discover sensitive values) and **replacement** (substitute them with anonymized equivalents).
+
+**Detection** accounts for ~63% of total time. Files are read once and cached in memory for reuse during replacement. Detection patterns are split into two groups: "always-scan" patterns (IPs and domains, which have no cheap keyword trigger) and "keyword-gated" patterns (namespace, bucket, endpoint, cluster, accessKeyID) that only run on files containing the relevant keyword.
+
+**Replacement** accounts for ~37%. Non-IP literals (domains, UUIDs, endpoints, access keys, namespaces, cluster names) are compiled into a single alternation regex and replaced in one pass via dict callback. IPs are handled separately through a dedicated `\d+\.\d+\.\d+\.\d+` pattern with dict lookup. This split strategy was measured to be **46% faster** than putting all patterns (including IPs) in one alternation, because the regex engine handles character-class patterns far more efficiently than long literal alternation lists.
+
+### Optional: Aho-Corasick acceleration
+
+If `pyahocorasick` is installed (`pip install pyahocorasick`), the script automatically uses it for the non-IP literal matching pass. This replaces the regex alternation with an O(text_length) trie automaton, which scales better when the number of patterns grows into the hundreds (large multi-cluster environments with many namespaces, domains, and endpoints). For bundles with fewer than ~50 non-IP patterns, the built-in mega-regex is already efficient and Aho-Corasick is not required.
+
+### Going further: Rust/PyO3
+
+For extreme throughput requirements (multi-GB bundles, automated pipelines processing dozens of bundles per day), the detection and replacement hot paths can be rewritten in Rust using PyO3. The Rust `aho_corasick` and `regex` crates (the same ones behind `ripgrep`) provide SIMD-accelerated matching that can reach 50–100 MB/s. The Python script would import the compiled Rust module as a drop-in replacement, with automatic fallback to pure Python if the Rust extension is not installed.
+
 ## Design decisions
 
-**Consistency** — The same original value always produces the same anonymized value across all 22+ log files. If `10.128.1.223` appears in both `gateway` and `executor-svc` logs, it maps to `198.51.0.21` in both.
+**Consistency** — The same original value always produces the same anonymized value across all log files. If `10.128.1.223` appears in both `gateway` and `executor-svc` logs, it maps to `198.51.0.21` in both.
 
-**IP range choice** — Anonymized IPs use `198.51.100.0/24` (RFC 5737 TEST-NET-2), a range explicitly reserved for documentation and examples that will never collide with real infrastructure.
+**Single-read architecture** — Every file is read once during detection, cached in memory, then reused for replacement. This eliminates the double I/O cost of scanning then re-reading.
 
-**Multi-format support** — K10 logs mix several formats. The replacer handles all of them:
-- Standard JSON: `"cluster_name":"9969be77-..."`
-- Fluentd/Ruby: `"namespace"=>"pacman"`
-- Prometheus labels: `bucket="oc02", endpoint="https://gateway.storjshare.io"`
-- Freetext: Kopia `description` strings, URL query params (`cl=oc02`)
+**IP range choice** — Anonymized IPs use `198.51.0.0/24` (RFC 5737 TEST-NET-2), a range explicitly reserved for documentation and examples that will never collide with real infrastructure.
+
+**Multi-format support** — K10 logs mix several formats and the replacer handles all of them: standard JSON (`"cluster_name":"9969be77-…"`), Fluentd/Ruby (`"namespace"=>"pacman"`), Prometheus labels (`bucket="oc02"`), and freetext (Kopia `description` strings, URL query params like `cl=oc02`).
 
 **Safe-list approach** — Platform namespaces (`openshift-*`, `kube-*`, `kasten-io`) and K8s/OCP API groups are explicitly preserved. Only customer-specific namespaces get anonymized.
 
@@ -154,11 +145,10 @@ The script has configuration constants at the top of the file that can be adjust
 
 ### Adding new detection patterns
 
-To anonymize additional categories, add:
+To anonymize additional categories:
 
-1. A new `set()` in `detect_values()` with the appropriate regex
-2. A new `anon_*()` helper function with a format template
-3. The replacement logic in `build_replacer()` → `replace_line()`
+1. Add a new `set()` in `detect_and_cache()` with the appropriate regex — if the pattern has a keyword anchor (e.g. `vaultAddr`), add it to the gated patterns list for efficiency.
+2. Add a `store.get_or_create()` call in `build_replacer()` with the format template and populate either `non_ip_lookup` (for literal replacement) or a dedicated pattern (for regex-based replacement).
 
 ## Limitations
 
