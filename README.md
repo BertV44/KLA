@@ -160,4 +160,4 @@ To anonymize additional categories:
 
 ## License
 
-Internal tooling — adapt and redistribute as needed within your TAM practice.
+Community tool, use it at your own risk.
