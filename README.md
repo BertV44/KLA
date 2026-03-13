@@ -10,11 +10,13 @@ K10's built-in log collector (`k10tools`) does a good job masking secret values,
 
 | # | Category | Example (before → after) |
 |---|----------|--------------------------|
-| 1 | **Cluster identity** – UUIDs and short names | `9969be77-a14a-4eb0-bc1b-cf15ce445146` → `00000000-0000-0000-abcd-ef0000000001` |
-| 2 | **FQDNs / OpenShift routes** | `k10-route-kasten-io.apps.oc02.home` → `redacted-host08.example.internal` |
-| 3 | **Object storage** – endpoints, buckets, S3 access keys | `gateway.storjshare.io` → `s3.anon-storage01.example.com` |
-| 4 | **IP addresses** – pod IPs, ClusterIPs, node IPs | `10.128.1.223` → `198.51.0.21` |
-| 5 | **Customer workload namespaces** | `pacman` → `app-ns-002` |
+| 1 | **Cluster identity** – UUIDs and short names | `a1b2c3d4-e5f6-…` → `00000000-…-ef0000000001`, `my-ocp-cluster` → `cluster01` |
+| 2 | **FQDNs / OpenShift routes** – any TLD | `kasten.apps.my-ocp-cluster.example.com` → `redacted-host02.example.internal` |
+| 3 | **Object storage** – endpoints, buckets, S3 access keys | `s3.region.provider.net` → `s3.anon-storage01.example.com` |
+| 4 | **IP addresses** – pod IPs, ClusterIPs, node IPs | `10.131.2.45` → `198.51.0.21` |
+| 5 | **Customer workload namespaces** – all lengths | `my-app-staging` → `app-ns-005`, `dev` → `app-ns-001` |
+| 6 | **Kopia debug logs** – S3 URLs, AWS SigV4 Credential= | `Credential=ABCD1234…/date/region/s3/…` → `Credential=REDACTED_ACCESS_KEY_002/…` |
+| 7 | **OIDC auth tokens** – authorization codes and state params | `code=xyzabc123…` → `code=REDACTED_OIDC_CODE_0013` |
 
 Standard OpenShift (`openshift-*`) and K10 (`kasten-io`) namespaces are **preserved** so logs remain useful for troubleshooting.
 
@@ -72,34 +74,28 @@ Structure:
 ```json
 {
   "cluster_uuid": {
-    "9969be77-a14a-4eb0-bc1b-cf15ce445146": "00000000-0000-0000-abcd-ef0000000001"
+    "a1b2c3d4-e5f6-7890-abcd-ef1234567890": "00000000-0000-0000-abcd-ef0000000001"
   },
   "cluster_name": {
-    "oc02": "cluster01"
+    "my-ocp-cluster": "cluster01"
   },
   "ip_address": {
-    "10.128.1.223": "198.51.0.21",
-    "172.30.68.164": "198.51.0.4"
+    "10.131.2.45": "198.51.0.21",
+    "172.30.99.10": "198.51.0.4"
   }
 }
 ```
 
 ## Performance
 
-Benchmarked on a 95 MB / 306k-line bundle (22 files, 65 unique patterns):
+Benchmarked on two real-world bundles:
 
-| Metric | Value |
-|--------|-------|
-| Total time | 8.1s |
-| Throughput | 11.8 MB/s |
+| Bundle | Size | Files | Patterns | Time | Throughput |
+|--------|------|-------|----------|------|------------|
+| Small (S3-compatible storage, 65 patterns) | 95 MB | 22 | 65 | 8.8s | 10.9 MB/s |
+| Large (OIDC+Kopia debug, 2919 patterns) | 285 MB | 44 | 2919 | 74s | 3.8 MB/s |
 
-Projected for larger bundles:
-
-| Bundle size | Estimated time |
-|-------------|----------------|
-| 200 MB | ~17s |
-| 500 MB | ~42s |
-| 1 GB | ~1m25s |
+The throughput difference reflects the OIDC token volume: the larger bundle had 2500+ unique OIDC state tokens and 45+ auth codes, handled by dedicated regex passes. The core mega-regex stays small (~90 literals).
 
 ### How it works under the hood
 
@@ -107,7 +103,12 @@ The script runs in two phases: **detection** (scan all files to discover sensiti
 
 **Detection** accounts for ~63% of total time. Files are read once and cached in memory for reuse during replacement. Detection patterns are split into two groups: "always-scan" patterns (IPs and domains, which have no cheap keyword trigger) and "keyword-gated" patterns (namespace, bucket, endpoint, cluster, accessKeyID) that only run on files containing the relevant keyword.
 
-**Replacement** accounts for ~37%. Non-IP literals (domains, UUIDs, endpoints, access keys, namespaces, cluster names) are compiled into a single alternation regex and replaced in one pass via dict callback. IPs are handled separately through a dedicated `\d+\.\d+\.\d+\.\d+` pattern with dict lookup. This split strategy was measured to be **46% faster** than putting all patterns (including IPs) in one alternation, because the regex engine handles character-class patterns far more efficiently than long literal alternation lists.
+**Replacement** uses a multi-pass strategy, each pass optimized for its data type:
+
+1. **Non-IP literals** (domains, UUIDs, endpoints, access keys, namespaces ≥ 4 chars, bucket names, cluster names) — single compiled alternation regex or Aho-Corasick trie, with dict callback.
+2. **IP addresses** — single `\d+\.\d+\.\d+\.\d+` pattern with dict lookup. Separate from literals because a pattern-based approach is 46% faster than 300+ IP alternations.
+3. **OIDC codes and states** — dedicated regex patterns (`code=xxx`, `state=oidc-auth-state-xxx`) with dict callback. Kept separate from the mega-regex to avoid performance degradation when thousands of unique tokens are present.
+4. **Short namespaces** (< 4 chars) — contextual regex that only replaces in known patterns (`namespace=`, `appName=`, `/namespaces/`, `"namespace"=>`), avoiding false positives from substring matches.
 
 ### Optional: Aho-Corasick acceleration
 
@@ -119,17 +120,17 @@ For extreme throughput requirements (multi-GB bundles, automated pipelines proce
 
 ## Design decisions
 
-**Consistency** — The same original value always produces the same anonymized value across all log files. If `10.128.1.223` appears in both `gateway` and `executor-svc` logs, it maps to `198.51.0.21` in both.
+**Consistency** — The same original value always produces the same anonymized value across all log files. If an IP appears in both `gateway` and `executor-svc` logs, it maps to the same anonymized IP in both.
 
 **Single-read architecture** — Every file is read once during detection, cached in memory, then reused for replacement. This eliminates the double I/O cost of scanning then re-reading.
 
 **IP range choice** — Anonymized IPs use `198.51.0.0/24` (RFC 5737 TEST-NET-2), a range explicitly reserved for documentation and examples that will never collide with real infrastructure.
 
-**Multi-format support** — K10 logs mix several formats and the replacer handles all of them: standard JSON (`"cluster_name":"9969be77-…"`), Fluentd/Ruby (`"namespace"=>"pacman"`), Prometheus labels (`bucket="oc02"`), and freetext (Kopia `description` strings, URL query params like `cl=oc02`).
+**Multi-format support** — K10 logs mix several formats and the replacer handles all of them: standard JSON (`"cluster_name":"a1b2c3d4-…"`), Fluentd/Ruby (`"namespace"=>"my-app"`), Prometheus labels (`bucket="my-bucket"`), freetext (Kopia `description` strings, URL query params like `cl=my-cluster` or `appName=dev`), Kopia HTTP debug dumps (full S3 request URLs with `Authorization: AWS4-HMAC-SHA256 Credential=…`), and OIDC redirect URLs (`code=xxx&state=oidc-auth-state-xxx`).
 
 **Safe-list approach** — Platform namespaces (`openshift-*`, `kube-*`, `kasten-io`) and K8s/OCP API groups are explicitly preserved. Only customer-specific namespaces get anonymized.
 
-**No secrets in scope** — The script does not target K8s Secret values (they're already masked by K10's collector as `<set to the key ... in secret ...>`). It does catch S3 access key IDs that appear in Kopia repository config dumps inside executor/logging-svc logs.
+**No K8s secrets in scope** — The script does not target K8s Secret values (they're already masked by K10's collector as `<set to the key ... in secret ...>`). It does catch: S3 access key IDs from both `accessKeyID=` fields and AWS SigV4 `Credential=` headers in Kopia HTTP debug logs, and OIDC authorization codes and state tokens from gateway redirect URLs.
 
 ## Customization
 
@@ -148,15 +149,36 @@ The script has configuration constants at the top of the file that can be adjust
 To anonymize additional categories:
 
 1. Add a new `set()` in `detect_and_cache()` with the appropriate regex — if the pattern has a keyword anchor (e.g. `vaultAddr`), add it to the gated patterns list for efficiency.
-2. Add a `store.get_or_create()` call in `build_replacer()` with the format template and populate either `non_ip_lookup` (for literal replacement) or a dedicated pattern (for regex-based replacement).
+2. In `build_replacer()`, decide the replacement strategy:
+   - **Literal** (few unique values, e.g. hostnames): add to `non_ip_lookup` → goes into the mega-regex.
+   - **Pattern-based** (many unique values, e.g. session IDs): add a dedicated regex pass in `replace_content()` with dict callback.
+   - **Contextual** (short values, false-positive risk): add to a separate contextual replacement like `short_ns_patterns`.
 
 ## Limitations
 
 - **Pod and container names** are not anonymized (they contain K10 component names, not customer data).
 - **Timestamps** are preserved as-is (needed for log correlation).
 - **K8s resource UUIDs** (action IDs, manifest IDs) are not anonymized — only the cluster UUID is. This is intentional: action UUIDs are needed for troubleshooting and are not externally meaningful.
-- **Secret checksums** (e.g. `checksum/secret: e21618e...`) are left in place. They are SHA hashes of the secret content, not the secret itself, and are useful for verifying that all pods share the same secret version.
+- **Secret checksums** (e.g. `checksum/secret: abc123…`) are left in place. They are SHA hashes of the secret content, not the secret itself, and are useful for verifying that all pods share the same secret version.
 - The script processes text files only. Binary content (if any) is skipped.
+
+## Changelog
+
+### v3.1 — Gap fixes from second bundle analysis
+
+Validated against two bundles of different sizes and configurations (different storage providers, authentication modes, and namespace counts).
+
+**Gap 1 — FQDN detection generalized to any TLD.** The original regex only matched `.home`, `.local`, `.lab`, `.corp`, `.internal`, `.lan`. Environments using other public TLDs were missed. Fixed by generalizing the `apps.*` pattern to match any TLD, and adding detection for `api.xxx` OCP API server FQDNs.
+
+**Gap 2 — S3 endpoints in Kopia HTTP debug logs.** Kopia debug files (`kopia_debug_files/*.log`) contain full HTTP request dumps with S3 URLs like `https://s3.region.provider.net/bucket-name/path`. The original script only detected endpoints from `endpoint="…"` key-value patterns. Added a dedicated URL-based S3 endpoint and bucket detection regex.
+
+**Gap 3 — AWS SigV4 Credential= in Authorization headers.** Kopia HTTP logs also include `Authorization: AWS4-HMAC-SHA256 Credential=ACCESS_KEY/date/region/s3/aws4_request`. The access key in this format was not caught by `accessKeyID=` patterns. Added `Credential=([a-zA-Z0-9]{20,})/` detection.
+
+**Gap 4 — OIDC authorization codes.** OIDC redirect URLs in gateway logs contain authorization codes (`code=abc123def456…`) that are potentially replayable. Added pattern-based detection and replacement.
+
+**Gap 5 — OIDC state tokens.** Hundreds to thousands of `state=oidc-auth-state-xxx` values appear in auth flows. To avoid mega-regex explosion (thousands of literals would kill performance), OIDC codes and states are handled by a dedicated regex pass with dict-callback, not as mega-regex literals. Each token is still individually tracked in the mapping table for reversibility.
+
+**Gap 6 — Short namespaces (< 4 chars).** Very short namespace names were missed because the word-boundary replacement threshold was set at 4 characters. Short namespaces are now replaced contextually in known patterns: `namespace="xxx"`, `"namespace"=>"xxx"`, `/namespaces/xxx/`, and `appName=xxx`. This avoids false positives from substring matches in unrelated text. The OCP cluster name is also auto-extracted from the base domain (e.g. `apps.my-cluster.example.com` → `my-cluster` added as cluster_name).
 
 ## License
 
