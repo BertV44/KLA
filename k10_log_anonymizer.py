@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """
-K10 Log Bundle Anonymizer v3 – Fully Optimized
-================================================
-Improvements over v2 (benchmarked on 95 MB / 306k-line bundle):
-  - Single-read: file content is cached between detection and replacement
-    (saves ~0.3s I/O vs reading every file twice)
-  - Split replacement strategy: non-IP literals in one mega-regex + IPs as
-    a pattern-based regex with dict callback. Proven 46% faster than putting
-    all 65 patterns in one alternation, because the regex engine handles
-    \\d+\\.\\d+\\.\\d+\\.\\d+ far more efficiently than 51 literal IP alternations.
-  - Keyword-gated detection: skips expensive regex on files that don't contain
-    relevant keywords (cluster_name, namespace, bucket, etc.)
-  - Optional Aho-Corasick: if pyahocorasick is installed, replaces the
-    mega-regex with an O(text_length) trie automaton for non-IP literals.
-  - Built-in per-phase timing for diagnostics.
+K10 Log Bundle Anonymizer v3
+=============================
+Anonymizes sensitive infrastructure data from Kasten K10 support log bundles.
+
+Architecture:
+  - Single-read: files cached between detection and replacement
+  - Split replacement: non-IP mega-regex + IP pattern + OIDC patterns
+  - OIDC tokens handled by regex pattern (not literals) to avoid mega-regex
+    explosion when thousands of unique state/code values are present
+  - Keyword-gated detection for cheap patterns
+  - Optional Aho-Corasick (pip install pyahocorasick) for large pattern sets
 
 Usage:
   python3 k10_log_anonymizer_v3.py <input_dir> <output_dir>
@@ -28,9 +25,6 @@ import uuid
 from collections import OrderedDict
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Optional: Aho-Corasick for O(n) literal matching (pip install pyahocorasick)
-# ---------------------------------------------------------------------------
 try:
     import ahocorasick
     HAS_AC = True
@@ -48,7 +42,7 @@ KNOWN_SAFE_NAMESPACES = {
 }
 SAFE_NAMESPACE_PREFIXES = ("openshift-", "kube-", "kasten-io")
 IP_PASSTHROUGH = {"0.0.0.0", "127.0.0.1", "255.255.255.255"}
-SAFE_DOMAIN_PATTERNS = {"apps.openshift.io", "apps.kio.kasten", "apiserver.local"}
+SAFE_DOMAIN_PATTERNS = {"apps.openshift.io", "apps.kio.kasten", "apiserver.local", "cluster.local"}
 SAFE_DOMAIN_SUBSTRINGS = ("kasten.io", "openshift.io", "kubernetes.io")
 
 # ---------------------------------------------------------------------------
@@ -74,7 +68,7 @@ class MappingStore:
 
 
 # ---------------------------------------------------------------------------
-# Detection (single-read, keyword-gated, content cached)
+# Detection
 # ---------------------------------------------------------------------------
 
 def detect_and_cache(input_dir: str) -> tuple[dict, list[tuple[str, str, str]]]:
@@ -82,22 +76,35 @@ def detect_and_cache(input_dir: str) -> tuple[dict, list[tuple[str, str, str]]]:
         "cluster_uuids": set(), "cluster_names": set(), "domains": set(),
         "storage_endpoints": set(), "buckets": set(), "ips": set(),
         "namespaces": set(), "access_keys": set(),
+        "oidc_codes": set(), "oidc_states": set(),
     }
 
-    # Patterns grouped by cost and trigger keywords
-    # "Always" patterns: no cheap pre-filter, must scan full content
+    # ---- Always-scan patterns ----
     pat_ip = re.compile(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b')
-    pat_dom = re.compile(
-        r'\b([a-zA-Z0-9][-a-zA-Z0-9]*\.apps\.[a-zA-Z0-9][-a-zA-Z0-9.]*'
-        r'|[a-zA-Z0-9][-a-zA-Z0-9]*\.(?:home|local|lab|corp|internal|lan))\b')
-    pat_bdom = re.compile(r'apps\.([a-zA-Z0-9][-a-zA-Z0-9]*)\.([a-z]+)\b')
 
-    # "Gated" patterns: only run if trigger keyword is in file
+    # [Gap 1] Generalized FQDN: *.apps.* (any TLD) + internal TLDs
+    pat_dom = re.compile(
+        r'\b('
+        r'[a-zA-Z0-9][-a-zA-Z0-9]*\.apps\.[a-zA-Z0-9][-a-zA-Z0-9.]*'
+        r'|[a-zA-Z0-9][-a-zA-Z0-9]*\.(?:home|local|lab|corp|internal|lan)'
+        r')\b')
+    pat_bdom = re.compile(r'apps\.([a-zA-Z0-9][-a-zA-Z0-9.]*)\.([a-z]{2,})\b')
+    # [Gap 1] OCP API endpoints: api.xxx.yyy.tld
+    pat_api_fqdn = re.compile(r'\bapi\.([a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-z]{2,})\b')
+
+    # [Gap 2] S3 full URLs in Kopia HTTP debug logs
+    pat_s3_url = re.compile(
+        r'https?://(s3[a-zA-Z0-9.]*\.[a-z]{2,}(?:\.[a-z]{2,})*)'
+        r'/([a-zA-Z0-9][-a-zA-Z0-9_]*)(?=/)')
+
+    # ---- Gated patterns ----
     gated = [
         ("cluster_name", re.compile(
             r'cluster_name["\s:=>]+["\s]*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', re.I),
             "cluster_uuids"),
         ("namespace", re.compile(r'namespace[=":>]+\s*"?\s*([a-z0-9][-a-z0-9]*)'),
+            "namespaces"),
+        ("appName", re.compile(r'appName=([a-z0-9][-a-z0-9]*)'),
             "namespaces"),
         ("bucket", re.compile(r'bucket[=":>]+\s*"?\s*([a-zA-Z0-9][-a-zA-Z0-9_.]*)'),
             "buckets"),
@@ -107,6 +114,15 @@ def detect_and_cache(input_dir: str) -> tuple[dict, list[tuple[str, str, str]]]:
             "cluster_names"),
         ("accessKeyID", re.compile(r'accessKeyID["\s:=>]+["\s]*([a-zA-Z0-9]{20,})'),
             "access_keys"),
+        # [Gap 3] AWS SigV4 Credential= in Authorization headers
+        ("Credential=", re.compile(r'Credential=([a-zA-Z0-9]{20,})/'),
+            "access_keys"),
+        # [Gap 4] OIDC authorization codes
+        ("code=", re.compile(r'[?&]code=([a-zA-Z0-9]{20,})'),
+            "oidc_codes"),
+        # [Gap 5] OIDC state tokens
+        ("oidc-auth-state", re.compile(r'state=(oidc-auth-state-[a-zA-Z0-9]+)'),
+            "oidc_states"),
     ]
 
     file_cache = []
@@ -123,10 +139,10 @@ def detect_and_cache(input_dir: str) -> tuple[dict, list[tuple[str, str, str]]]:
 
             file_cache.append((fpath, rel, content))
 
-            # Always-scan patterns
             for m in pat_ip.finditer(content):
                 if m.group(1) not in IP_PASSTHROUGH:
                     detected["ips"].add(m.group(1))
+
             for m in pat_dom.finditer(content):
                 dom = m.group(1).rstrip("/")
                 if dom not in SAFE_DOMAIN_PATTERNS and not any(s in dom for s in SAFE_DOMAIN_SUBSTRINGS):
@@ -135,15 +151,32 @@ def detect_and_cache(input_dir: str) -> tuple[dict, list[tuple[str, str, str]]]:
                 dom = f"apps.{m.group(1)}.{m.group(2)}"
                 if dom not in SAFE_DOMAIN_PATTERNS and not any(s in dom for s in SAFE_DOMAIN_SUBSTRINGS):
                     detected["domains"].add(dom)
+                    # Extract OCP cluster name from base domain (apps.CLUSTERNAME.suffix)
+                    # e.g. apps.plt-rbx-nsxt.snc.tdp.ovh → plt-rbx-nsxt
+                    cluster_part = m.group(1).split(".")[0]
+                    if len(cluster_part) >= 3 and cluster_part not in ("apps", "api"):
+                        detected["cluster_names"].add(cluster_part)
 
-            # Gated patterns (skip if keyword not in file)
+            for m in pat_api_fqdn.finditer(content):
+                full = f"api.{m.group(1)}"
+                if not any(s in full for s in SAFE_DOMAIN_SUBSTRINGS):
+                    detected["domains"].add(full)
+
+            for m in pat_s3_url.finditer(content):
+                ep = m.group(1)
+                bkt = m.group(2)
+                if not any(x in ep for x in ["svc.cluster", "kasten.io"]):
+                    detected["storage_endpoints"].add(ep)
+                if not re.match(r'^[0-9a-f]{8}-', bkt):
+                    detected["buckets"].add(bkt)
+
             for keyword, pattern, target in gated:
                 if keyword not in content:
                     continue
                 for m in pattern.finditer(content):
                     val = m.group(1)
                     if target == "namespaces":
-                        if val not in KNOWN_SAFE_NAMESPACES and not val.startswith(SAFE_NAMESPACE_PREFIXES):
+                        if len(val) >= 2 and val not in KNOWN_SAFE_NAMESPACES and not val.startswith(SAFE_NAMESPACE_PREFIXES):
                             detected[target].add(val)
                     elif target == "storage_endpoints":
                         if not any(x in val for x in ["svc.cluster", "kasten.io", "kubernetes.io"]):
@@ -160,15 +193,15 @@ def detect_and_cache(input_dir: str) -> tuple[dict, list[tuple[str, str, str]]]:
 
 
 # ---------------------------------------------------------------------------
-# Build split replacer: non-IP mega-regex + IP pattern
+# Build replacer
 # ---------------------------------------------------------------------------
 
 def build_replacer(detected: dict):
     store = MappingStore()
-    non_ip_lookup = {}  # literal string -> replacement
-    ip_lookup = {}      # ip string -> replacement
+    non_ip_lookup = {}
+    ip_lookup = {}
+    short_ns_lookup = {}
 
-    # Pre-seed all mappings
     for uid in detected.get("cluster_uuids", []):
         r = store.get_or_create("cluster_uuid", uid,
             lambda n: str(uuid.UUID(int=0xABCDEF0000000000 + n)))
@@ -196,25 +229,39 @@ def build_replacer(detected: dict):
         r = store.get_or_create("access_key", ak, lambda n: f"REDACTED_ACCESS_KEY_{n:03d}")
         non_ip_lookup[ak] = r
 
+    # [Gap 6] Namespaces: >= 4 chars go in mega-regex, < 4 go contextual
     for ns in detected.get("namespaces", []):
         r = store.get_or_create("namespace", ns, lambda n: f"app-ns-{n:03d}")
         if len(ns) >= 4:
             non_ip_lookup[ns] = r
+        else:
+            short_ns_lookup[ns] = r
 
-    # IPs stay separate – pattern-based matching is 46% faster than literals
+    # [Gap 4+5] OIDC: pre-seed mapping for the summary, but replace by PATTERN
+    # not by literal. This keeps the mega-regex small (no 2500+ extra entries).
+    oidc_code_map = {}
+    for code in detected.get("oidc_codes", []):
+        r = store.get_or_create("oidc_code", code, lambda n: f"REDACTED_OIDC_CODE_{n:04d}")
+        oidc_code_map[code] = r
+
+    oidc_state_map = {}
+    for state in detected.get("oidc_states", []):
+        r = store.get_or_create("oidc_state", state, lambda n: f"oidc-auth-state-redacted-{n:04d}")
+        oidc_state_map[state] = r
+
+    # IPs: pattern-based
     for ip in detected.get("ips", []):
         if ip not in IP_PASSTHROUGH:
             r = store.get_or_create("ip_address", ip,
                 lambda n: f"198.51.{(n // 256) % 256}.{n % 256}")
             ip_lookup[ip] = r
 
-    # ---- Build non-IP matcher ----
+    # ---- Build non-IP literal matcher (no OIDC, no short ns) ----
     if HAS_AC:
         automaton = ahocorasick.Automaton()
         for original, replacement in non_ip_lookup.items():
             automaton.add_word(original, (original, replacement))
         automaton.make_automaton()
-
         def replace_literals(text: str) -> str:
             result = []
             last_end = 0
@@ -235,14 +282,53 @@ def build_replacer(detected: dict):
         else:
             replace_literals = lambda text: text
 
-    # ---- IP pattern matcher (single regex, dict callback) ----
     ip_pattern = re.compile(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b')
 
+    # [Gap 4] OIDC code pattern: replace code=xxx with dict lookup
+    oidc_code_pat = re.compile(r'([?&]code=)([a-zA-Z0-9]{20,})')
+    # [Gap 5] OIDC state pattern: replace state=oidc-auth-state-xxx
+    oidc_state_pat = re.compile(r'(state=)(oidc-auth-state-[a-zA-Z0-9]+)')
+
+    # [Gap 6] Short namespace contextual patterns
+    short_ns_patterns = []
+    for ns, replacement in short_ns_lookup.items():
+        escaped = re.escape(ns)
+        short_ns_patterns.append((
+            re.compile(
+                r'(namespace[=":>]+\s*"?)' + escaped + r'("?)'
+                r'|("namespace"\s*=>\s*")' + escaped + r'(")'
+                r'|(/namespaces/)' + escaped + r'(?=/|"|\s|$)'
+                r'|(appName=)' + escaped + r'(?=&|"|\s|$)'
+            ),
+            ns, replacement
+        ))
+
     def replace_content(text: str) -> str:
-        # Pass 1: all non-IP literals (domains, UUIDs, endpoints, keys, ns, clusters, buckets)
+        # Pass 1: non-IP literals (domains, UUIDs, endpoints, keys, ns>=4, buckets, clusters)
         text = replace_literals(text)
-        # Pass 2: IPs via pattern + dict lookup
+        # Pass 2: IPs
         text = ip_pattern.sub(lambda m: ip_lookup.get(m.group(0), m.group(0)), text)
+        # Pass 3: OIDC codes (pattern-based, dict lookup)
+        if oidc_code_map:
+            text = oidc_code_pat.sub(
+                lambda m: m.group(1) + oidc_code_map.get(m.group(2), m.group(2)), text)
+        # Pass 4: OIDC states (pattern-based, dict lookup)
+        if oidc_state_map:
+            text = oidc_state_pat.sub(
+                lambda m: m.group(1) + oidc_state_map.get(m.group(2), m.group(2)), text)
+        # Pass 5: short namespaces (contextual only)
+        for pat, ns, replacement in short_ns_patterns:
+            def _sub(m, _r=replacement):
+                if m.group(1) is not None:
+                    return m.group(1) + _r + (m.group(2) or "")
+                elif m.group(3) is not None:
+                    return m.group(3) + _r + m.group(4)
+                elif m.group(5) is not None:
+                    return m.group(5) + _r
+                elif m.group(6) is not None:
+                    return m.group(6) + _r
+                return m.group(0)
+            text = pat.sub(_sub, text)
         return text
 
     return replace_content, store
@@ -280,7 +366,7 @@ def process_bundle(input_dir: str, output_dir: str):
     n_non_ip = total_patterns - len(detected.get("ips", []))
     n_ip = len(detected.get("ips", []))
     backend = "Aho-Corasick" if HAS_AC else "mega-regex"
-    print(f"\n[*] Replacement: {backend} ({n_non_ip} literals) + IP pattern ({n_ip} addresses)")
+    print(f"\n[*] Replacement: {backend} + IP pattern ({n_ip}) + OIDC patterns + short-ns patterns")
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -297,7 +383,6 @@ def process_bundle(input_dir: str, output_dir: str):
             print(f"    [!] Skipped {rel}: {e}")
     t_replace = time.time()
 
-    # Write mapping table
     mapping_path = os.path.join(output_dir, "_anonymization_mapping.json")
     mapping = store.dump()
     with open(mapping_path, "w") as f:
@@ -310,12 +395,18 @@ def process_bundle(input_dir: str, output_dir: str):
         for cat, entries in mapping.items():
             f.write(f"[{cat}] ({len(entries)} entries)\n")
             f.write("-" * 40 + "\n")
-            for orig, anon in entries.items():
-                f.write(f"  {orig:<50s} -> {anon}\n")
+            if len(entries) <= 50:
+                for orig, anon in entries.items():
+                    f.write(f"  {orig:<60s} -> {anon}\n")
+            else:
+                shown = list(entries.items())
+                for orig, anon in shown[:10]:
+                    f.write(f"  {orig:<60s} -> {anon}\n")
+                f.write(f"  ... ({len(entries) - 10} more entries, see JSON for full list)\n")
             f.write("\n")
 
     t_end = time.time()
-    rate = total_mb / (t_end - t0)
+    rate = total_mb / (t_end - t0) if (t_end - t0) > 0 else 0
 
     print(f"\n[+] Anonymized {file_count} files -> {output_dir}/")
     print(f"[+] Mapping table -> {mapping_path}")
